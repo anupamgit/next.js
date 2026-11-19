@@ -89,5 +89,10 @@
     "publish": false,
     "timeout": 1800,
     "metrics": "pokedex"
+  },
+  "agent-063-request-insights-retrospective": {
+    "skills": ["next-request-insights"],
+    "publish": false,
+    "timeout": 900
   }
 }
