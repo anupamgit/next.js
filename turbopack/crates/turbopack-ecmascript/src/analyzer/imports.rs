@@ -639,6 +639,14 @@ impl ImportMap {
         export: Option<ConstantString>,
     ) -> JsValue<'a> {
         let r = &self.references[esm_reference_idx];
+        // The default export of the Node.js `process` module is the `process` object itself, i.e.
+        // the same as the module namespace object (as far as the analysis is concerned). Model
+        // `import process from "process"` like `import * as process from "process"`, so that it
+        // links to the well-known `process` object.
+        let export = export.filter(|export| {
+            !(export.as_str() == "default"
+                && matches!(r.module_path.as_bytes(), b"process" | b"node:process"))
+        });
         if let Some(export) = export {
             JsValue::member(
                 arena,
