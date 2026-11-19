@@ -133,6 +133,7 @@ use crate::{
         Endpoint, EndpointGroup, EndpointGroupEntry, EndpointGroupKey, EndpointGroups, Endpoints,
         Route,
     },
+    route_activation::route_activation_state,
     versioned_content_map::VersionedContentMap,
 };
 
@@ -1482,9 +1483,34 @@ impl Project {
         Vc::cell(self.deferred_entries.clone())
     }
 
+    /// Whether every endpoint builds its own module graph. This is only about the graph topology.
+    /// The development chunking policy (e.g. the shared runtime chunk, see
+    /// [`Project::is_partial_module_graph`]) is configured independently of it, so that the single
+    /// development graph (see [`Project::single_dev_module_graph`]) keeps that policy. The emitted
+    /// chunks can still differ, since chunking also depends on which entries share the graph.
     #[turbo_tasks::function]
-    pub(super) async fn per_page_module_graph(&self) -> Result<Vc<bool>> {
-        Ok(Vc::cell(*self.mode.await? == NextMode::Development))
+    pub(super) async fn per_page_module_graph(self: Vc<Self>) -> Result<Vc<bool>> {
+        Ok(Vc::cell(
+            self.next_mode().await?.is_development() && !*self.single_dev_module_graph().await?,
+        ))
+    }
+
+    /// Whether development uses a single whole-app module graph that only contains the activated
+    /// endpoints (see [`route_activation_state`]). Always `false` outside of development.
+    #[turbo_tasks::function]
+    pub(super) async fn single_dev_module_graph(&self) -> Result<Vc<bool>> {
+        Ok(self
+            .next_config
+            .turbopack_single_dev_module_graph(*self.mode.await?))
+    }
+
+    /// Whether the module graphs only cover part of the app, so that no single graph can decide
+    /// what can be left out of output shared by all graphs (e.g. the runtime chunk). This is the
+    /// case for per-page graphs and for the single development graph, which only contains the
+    /// activated endpoints.
+    #[turbo_tasks::function]
+    pub(super) async fn is_partial_module_graph(&self) -> Result<Vc<bool>> {
+        Ok(Vc::cell(self.mode.await?.is_development()))
     }
 
     #[turbo_tasks::function]
@@ -1719,10 +1745,44 @@ impl Project {
         Ok(Vc::cell(endpoints))
     }
 
+    /// The endpoints whose entries are part of the whole-app module graph.
+    ///
+    /// With the single development module graph, only the activated endpoints are included (see
+    /// [`route_activation_state`]), unless `include_inactive` is set. Endpoints without an
+    /// [`Endpoint::activation_key`] are always included.
     #[turbo_tasks::function]
-    pub async fn get_all_entries(self: Vc<Self>) -> Result<Vc<GraphEntries>> {
+    async fn module_graph_endpoints(
+        self: ResolvedVc<Self>,
+        include_inactive: bool,
+    ) -> Result<Vc<Endpoints>> {
+        let endpoints = self.get_all_endpoints(false);
+        if include_inactive || !*self.single_dev_module_graph().await? {
+            return Ok(endpoints);
+        }
+        let active = endpoints
+            .await?
+            .iter()
+            .map(async |&endpoint| {
+                Ok(match endpoint.activation_key().owned().await? {
+                    Some(key) => route_activation_state(*self, key)
+                        .await?
+                        .is_active()
+                        .then_some(endpoint),
+                    None => Some(endpoint),
+                })
+            })
+            .try_flat_join()
+            .await?;
+        Ok(Vc::cell(active))
+    }
+
+    #[turbo_tasks::function]
+    pub async fn get_all_entries(
+        self: Vc<Self>,
+        include_inactive: bool,
+    ) -> Result<Vc<GraphEntries>> {
         let endpoint_entries = self
-            .get_all_endpoints(false)
+            .module_graph_endpoints(include_inactive)
             .await?
             .iter()
             .map(|endpoint| endpoint.entries().owned())
@@ -1749,9 +1809,10 @@ impl Project {
     pub async fn get_all_additional_entries(
         self: Vc<Self>,
         graphs: Vc<ModuleGraph>,
+        include_inactive: bool,
     ) -> Result<Vc<GraphEntries>> {
         let result = GraphEntries::concatenate(
-            self.get_all_endpoints(false)
+            self.module_graph_endpoints(include_inactive)
                 .await?
                 .iter()
                 .map(|endpoint| endpoint.additional_entries(graphs).owned())
@@ -1816,11 +1877,14 @@ impl Project {
     ///
     /// Use this instead of [Self::whole_app_module_graphs] when you need to collect issues from
     /// the computation (e.g. for the `get_compilation_issues` MCP tool).
+    ///
+    /// This graph contains all endpoints, also those that are not activated yet with the single
+    /// development module graph, without activating them.
     #[turbo_tasks::function]
     pub async fn whole_app_module_graphs_without_dropping_issues(
         self: ResolvedVc<Self>,
     ) -> Result<Vc<BaseAndFullModuleGraph>> {
-        let module_graphs_op = whole_app_module_graph_operation(self);
+        let module_graphs_op = whole_app_module_graph_operation(self, true);
         let module_graphs_vc = module_graphs_op.connect();
         scale_down_node_pool(self).await?;
         Ok(module_graphs_vc)
@@ -1832,7 +1896,7 @@ impl Project {
     pub async fn whole_app_module_graphs(
         self: ResolvedVc<Self>,
     ) -> Result<Vc<BaseAndFullModuleGraph>> {
-        let module_graphs_op = whole_app_module_graph_operation(self);
+        let module_graphs_op = whole_app_module_graph_operation(self, false);
         let module_graphs_vc = if self.next_mode().await?.is_production() {
             module_graphs_op.connect()
         } else {
@@ -1916,7 +1980,7 @@ impl Project {
                 .turbo_nested_async_chunking(self.next_mode(), true),
             shared_runtime: self.next_config().turbo_shared_runtime(self.next_mode()),
             external_browser_runtime: self.next_config().enable_external_browser_runtime(),
-            per_page_module_graph: self.per_page_module_graph(),
+            partial_module_graph: self.is_partial_module_graph(),
             lazy_dynamic_imports: self
                 .next_config()
                 .turbopack_lazy_dynamic_imports(*self.next_mode().await?),
@@ -2027,7 +2091,7 @@ impl Project {
             css_url_suffix,
             hash_salt: self.next_config().output_hash_salt().to_resolved().await?,
             style_groups_algorithm: self.next_config().css_chunking().owned().await?,
-            per_page_module_graph: self.per_page_module_graph(),
+            partial_module_graph: self.is_partial_module_graph(),
             lazy_dynamic_imports: supports_lazy_dynamic_imports
                 && *self
                     .next_config()
@@ -3244,9 +3308,13 @@ pub async fn compute_whole_app_client_style_groups_early(project: Vc<Project>) -
 
 // This is a performance optimization. This function is a root aggregation function that
 // aggregates over the whole subgraph.
+//
+// `include_inactive` includes the endpoints that are not activated yet with the single development
+// module graph (see `Project::module_graph_endpoints`).
 #[turbo_tasks::function(operation, root)]
 async fn whole_app_module_graph_operation(
     project: ResolvedVc<Project>,
+    include_inactive: bool,
 ) -> Result<Vc<BaseAndFullModuleGraph>> {
     let start = Instant::now();
     let wall_start = SystemTime::now();
@@ -3260,7 +3328,10 @@ async fn whole_app_module_graph_operation(
             .await?;
         let graph_options = project.module_graph_options().await?;
         let base_single_module_graph = SingleModuleGraph::new_with_entries(
-            project.get_all_entries().to_resolved().await?,
+            project
+                .get_all_entries(include_inactive)
+                .to_resolved()
+                .await?,
             graph_options,
         );
         let base_visited_modules = VisitedModules::from_graph(base_single_module_graph);
@@ -3280,7 +3351,7 @@ async fn whole_app_module_graph_operation(
         };
 
         let additional_entries = project
-            .get_all_additional_entries(base.connect())
+            .get_all_additional_entries(base.connect(), include_inactive)
             .to_resolved()
             .await?;
 
