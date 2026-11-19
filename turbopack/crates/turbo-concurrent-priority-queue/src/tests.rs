@@ -26,26 +26,41 @@ fn state<T>(q: &Queue<T>) -> u64 {
 }
 
 fn shard_len<T>(q: &Queue<T>, index: usize) -> usize {
-    q.shards[index].lock().buckets.values().map(Vec::len).sum()
+    q.shards[index]
+        .shard
+        .lock()
+        .buckets
+        .values()
+        .map(Vec::len)
+        .sum()
 }
 
 fn all_shards_empty<T>(q: &Queue<T>) -> bool {
-    q.shards.iter().all(|shard| shard.lock().is_empty())
+    q.shards.iter().all(|slot| slot.shard.lock().is_empty())
+}
+
+/// The published top rank of every shard matches its contents.
+fn assert_tops_match<T>(q: &Queue<T>) {
+    for (index, slot) in q.shards.iter().enumerate() {
+        let shard = slot.shard.lock();
+        assert_eq!(
+            slot.top.load(Ordering::Acquire),
+            shard.published_top(),
+            "published top of shard {index}"
+        );
+    }
 }
 
 fn drain<T>(q: &Queue<T>) -> Vec<T> {
     std::iter::from_fn(|| q.pop().map(|(_, item)| item)).collect()
 }
 
-/// Drives a search to its end by hand.
+/// Drives a search that was started by hand (state set to `SEARCHING`) to its end, like the search
+/// lock holder does.
 fn run_search<T>(q: &Queue<T>) {
-    loop {
-        let state = state(q);
-        if !is_searching(state) {
-            return;
-        }
-        q.help_search(state);
-    }
+    let _search = q.search_lock.lock();
+    q.finish_search(q.scan_tops());
+    assert!(!is_searching(state(q)));
 }
 
 /// From a single thread, priorities pop highest first; within a priority a single shard is LIFO.
@@ -83,8 +98,9 @@ fn push_many_queues_all_items() {
     assert!(q.is_empty());
 }
 
-/// Popping the last item of a rank above 0 leaves a stale `highest` without bits in the state
-/// word (until the next pop searches); `is_empty` must still report the drained queue as empty.
+/// Popping the last item of a rank above 0 leaves a stale `highest` (and the emptied shard's bit)
+/// in the state word until the next pop clears it and searches; `is_empty` must still report the
+/// drained queue as empty.
 #[test]
 fn is_empty_after_draining_a_higher_rank() {
     let q: Queue<u32> = Queue::new();
@@ -184,34 +200,229 @@ fn search_finds_next_priority() {
     assert!(all_shards_empty(&q));
 }
 
-/// A search that only finds rank-0 items can't tell them apart from empty shards in `highest`, so
-/// it ends with all bits set; the items are still popped, and lazy clearing then reaches the empty
-/// state.
+/// A search that only finds rank-0 items ends with `highest == 0` and exactly the bits of the
+/// shards that have them (their published tops), so the items are popped and the queue then reaches
+/// the empty state.
 #[test]
-fn search_with_only_rank_zero_items_ends_with_all_bits() {
+fn search_with_only_rank_zero_items_sets_their_bits() {
     let q: Queue<u32> = Queue::new();
     on_shard(0, || q.push(0, 0));
     on_shard(1, || q.push(4, 4));
     assert_eq!(on_shard(1, || q.pop()).unwrap().1, 4);
-    // Shard 1 cleared its bit: nobody has rank 4 any more.
-    assert_eq!(state(&q), make_state(4, false, 0));
+    // Shard 1 ran empty and kept its bit (lazy clearing).
+    assert_eq!(state(&q), make_state(4, false, shard_bit(1)));
     q.state
         .compare_exchange(
-            make_state(4, false, 0),
+            make_state(4, false, shard_bit(1)),
             SEARCHING,
             Ordering::AcqRel,
             Ordering::Relaxed,
         )
         .unwrap();
     run_search(&q);
-    assert_eq!(state(&q), make_state(0, false, ALL_BITS));
+    assert_eq!(state(&q), make_state(0, false, shard_bit(0)));
     assert_eq!(on_shard(5, || q.pop()).unwrap().1, 0);
     assert!(on_shard(5, || q.pop()).is_none());
     assert_eq!(state(&q), 0);
 }
 
-/// A search over empty shards ends with all bits set, which lazy clearing turns into the empty
-/// state, so `pop` returns `None`.
+/// A pop that empties its shard keeps the shard's bit, so a thread that keeps pushing and popping
+/// the same priority doesn't write the state word; the stale bit is cleared by the next pop that
+/// finds the shard without the highest priority.
+#[test]
+fn emptying_pop_keeps_the_bit() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(0, || q.push(0, 100));
+    on_shard(3, || {
+        for item in 0..5 {
+            q.push(0, item);
+            let expected = make_state(0, false, shard_bit(0) | shard_bit(3));
+            assert_eq!(state(&q), expected, "after push {item}");
+            assert_eq!(q.pop().unwrap().1, item);
+            assert_eq!(state(&q), expected, "after pop {item}");
+        }
+        // Shard 3 is empty: this pop clears its bit and steals from shard 0.
+        assert_eq!(q.pop().unwrap().1, 100);
+    });
+    assert!(on_shard(3, || q.pop()).is_none());
+    assert_eq!(state(&q), 0);
+    assert_tops_match(&q);
+}
+
+/// A shard filled by a steal clears its bit when a pop empties it (unlike one filled by pushes), so
+/// thieves don't keep trying a drained shard.
+#[test]
+fn emptying_a_stolen_batch_clears_the_bit() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(0, || (0..2).for_each(|item| q.push(5, item)));
+    // Shard 1 steals one item (half of two, rounded up) and pops it: shard 1 is empty again.
+    assert_eq!(on_shard(1, || q.pop()), Some((5, 1)));
+    assert_eq!(shard_len(&q, 1), 0);
+    assert_eq!(state(&q), make_state(5, false, shard_bit(0)));
+}
+
+/// Shards that ran empty after pushes keep their bits, but the spurious bits are cleared as
+/// thieves try those shards, so draining reaches the empty state.
+#[test]
+fn spurious_bits_are_cleared_while_draining() {
+    let q: Queue<u32> = Queue::new();
+    // Shards 1..=5 ran empty and kept their bits; shard 6 has the work.
+    for index in 1..=5 {
+        on_shard(index, || {
+            q.push(0, 0);
+            q.pop().unwrap();
+        });
+    }
+    on_shard(6, || (10..14).for_each(|item| q.push(0, item)));
+    let spurious: u64 = (1..=5).map(shard_bit).sum();
+    assert_eq!(state(&q), make_state(0, false, spurious | shard_bit(6)));
+    assert_eq!(on_shard(9, || drain(&q)), vec![13, 12, 11, 10]);
+    // Draining cleared every spurious bit on the way to the empty state.
+    assert_eq!(state(&q), 0);
+}
+
+/// A pop that leaves lower priorities in its shard clears the shard's bit right away: the bit is
+/// known to be spurious.
+#[test]
+fn pop_leaving_lower_items_clears_the_bit() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(2, || {
+        q.push(1, 1);
+        q.push(6, 6);
+        assert_eq!(state(&q), make_state(6, false, shard_bit(2)));
+        assert_eq!(q.pop().unwrap().1, 6);
+    });
+    assert_eq!(state(&q), make_state(6, false, 0));
+}
+
+/// The search reads published tops without locking: a shard that is locked by someone else
+/// doesn't block the search, and the search finds its items.
+#[test]
+fn search_does_not_wait_for_locked_shards() {
+    let q: Arc<Queue<u32>> = Arc::new(Queue::new());
+    on_shard(4, || q.push(3, 3));
+    on_shard(7, || q.push(2, 2));
+    // A stale `highest` without bits: the next pop searches.
+    q.state.store(make_state(9, false, 0), Ordering::Release);
+    let guard = q.shards[4].shard.lock();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = {
+        let q = q.clone();
+        std::thread::spawn(move || {
+            q.search();
+            sender.send(state(&q)).unwrap();
+        })
+    };
+    let result = receiver.recv_timeout(Duration::from_secs(5));
+    drop(guard);
+    worker.join().unwrap();
+    assert_eq!(
+        result.expect("the search must not wait for a locked shard"),
+        make_state(3, false, shard_bit(4))
+    );
+    assert_eq!(on_shard(9, || drain(&q)), vec![3, 2]);
+}
+
+/// The search's finish merges what pushes wrote into the word during the search with its scan:
+/// `highest` is the maximum of both, the bits are the union. A push that the scan missed (because
+/// it came after the scan) is therefore not lost.
+#[test]
+fn search_finish_merges_pushes_during_the_search() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(2, || q.push(4, 4));
+    q.state.store(make_state(9, false, 0), Ordering::Release);
+    let search = q.search_lock.lock();
+    q.state.store(SEARCHING, Ordering::Release);
+    let scan = q.scan_tops();
+    assert_eq!(scan, (Some(4), shard_bit(2)));
+    // Pushes after the scan: one higher, one lower than what the scan found.
+    on_shard(5, || q.push(6, 6));
+    on_shard(6, || q.push(1, 1));
+    assert_eq!(state(&q), make_state(6, true, shard_bit(5) | shard_bit(6)));
+    q.finish_search(scan);
+    drop(search);
+    assert_eq!(
+        state(&q),
+        make_state(6, false, shard_bit(2) | shard_bit(5) | shard_bit(6))
+    );
+    assert_eq!(on_shard(9, || drain(&q)), vec![6, 4, 1]);
+    assert_eq!(state(&q), 0);
+}
+
+/// A search that scanned nothing must not end empty when a push came in after the scan (the stale
+/// scan of the cross-search ABA): the push is in the word, so the finish keeps it.
+#[test]
+fn empty_scan_does_not_hide_a_push_during_the_search() {
+    let q: Queue<u32> = Queue::new();
+    q.state.store(make_state(7, false, 0), Ordering::Release);
+    let search = q.search_lock.lock();
+    q.state.store(SEARCHING, Ordering::Release);
+    let scan = q.scan_tops();
+    assert_eq!(scan, (None, 0));
+    on_shard(5, || q.push(3, 3));
+    q.finish_search(scan);
+    drop(search);
+    assert_eq!(state(&q), make_state(3, false, shard_bit(5)));
+    assert_eq!(on_shard(1, || q.pop()), Some((3, 3)));
+    assert!(on_shard(1, || q.pop()).is_none());
+}
+
+/// While a search runs, pops wait for it instead of popping or returning `None`; a thread that
+/// wants to search while another one holds the search lock waits too, so it never finishes someone
+/// else's search.
+#[test]
+fn pops_wait_for_a_running_search() {
+    let q: Arc<Queue<u32>> = Arc::new(Queue::new());
+    on_shard(3, || q.push(2, 2));
+    q.state.store(make_state(8, false, 0), Ordering::Release);
+    // This thread is the search lock holder that started a search.
+    let search = q.search_lock.lock();
+    q.state.store(SEARCHING, Ordering::Release);
+    let done = Arc::new(AtomicBool::new(false));
+    let popper = {
+        let (q, done) = (q.clone(), done.clone());
+        std::thread::spawn(move || {
+            let popped = on_shard(9, || q.pop());
+            done.store(true, Ordering::Release);
+            popped
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !done.load(Ordering::Acquire),
+        "a pop returned during the search"
+    );
+    assert!(is_searching(state(&q)), "someone else finished the search");
+    q.finish_search(q.scan_tops());
+    drop(search);
+    assert_eq!(popper.join().unwrap(), Some((2, 2)));
+    assert!(q.is_empty());
+}
+
+/// Published tops follow every change of a shard: pushes, pops, steals, takeovers.
+#[test]
+fn published_tops_follow_shard_changes() {
+    let q: Queue<u32> = Queue::new();
+    assert_tops_match(&q);
+    on_shard(0, || (0..8).for_each(|item| q.push(5, item)));
+    on_shard(0, || q.push_many([(1, 100), (9, 9)]));
+    assert_tops_match(&q);
+    on_shard(1, || q.push(2, 50));
+    assert_eq!(on_shard(1, || q.pop()).unwrap().1, 9);
+    assert_tops_match(&q);
+    // Shard 1 only has priority 2: it steals half of shard 0's priority-5 items.
+    assert_eq!(on_shard(1, || q.pop()).unwrap().1, 7);
+    assert_tops_match(&q);
+    set_steal_pressure(&q, 0, STEAL_PRESSURE_THRESHOLD);
+    on_shard(2, || q.pop()).unwrap();
+    assert_tops_match(&q);
+    on_shard(3, || drain(&q));
+    assert_tops_match(&q);
+    assert!(q.is_empty());
+}
+
+/// A search whose scan finds every shard empty, with no concurrent pushes, ends with the empty
+/// state word, so `pop` returns `None`.
 #[test]
 fn search_over_empty_shards_ends_empty() {
     let q: Queue<u32> = Queue::new();
@@ -237,20 +448,41 @@ fn push_updates_state_word() {
     assert_eq!(state(&q), make_state(9, false, shard_bit(2) | shard_bit(4)));
 }
 
-/// A push during a search counts as a check of its shard, even if that shard was already checked,
-/// so the search can't end below it.
+/// A rank verified under a shard lock stays poppable after a concurrent raise; without a verified
+/// rank, the pop doesn't go below the current `highest`.
 #[test]
-fn push_during_search_is_checked() {
+fn verified_rank_survives_a_raise() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(0, || (0..3).for_each(|item| q.push(5, item)));
+    // A raise by another shard after this pop verified rank 5.
+    on_shard(1, || q.push(9, 9));
+    let mut shard = q.shards[0].shard.lock();
+    assert!(matches!(
+        q.pop_locked(0, &mut shard, None),
+        ShardPop::NotHighest
+    ));
+    match q.pop_locked(0, &mut shard, Some(5)) {
+        ShardPop::Item(priority, item) => assert_eq!((priority, item), (5, 2)),
+        _ => panic!("the verified rank must be poppable"),
+    }
+    drop(shard);
+    // A plain pop from shard 0 takes the raised priority first.
+    assert_eq!(on_shard(0, || q.pop()), Some((9, 9)));
+    assert_tops_match(&q);
+}
+
+/// A push during a search publishes its rank and bit, so the search can't end below it, even if
+/// the finishing thread read the shard's top before the push.
+#[test]
+fn push_during_search_is_not_lost() {
     let q: Queue<u32> = Queue::new();
     on_shard(0, || q.push(2, 2));
-    // Simulate a search that started and already checked the (empty) shard 5.
     q.state.store(SEARCHING, Ordering::Release);
-    q.check_shard(5, &q.shards[5].lock());
-    assert_eq!(state(&q), make_state(0, true, shard_bit(5)));
+    // The push lands while the search runs: it raises the searching `highest` and sets its bit.
     on_shard(5, || q.push(8, 8));
     assert_eq!(state(&q), make_state(8, true, shard_bit(5)));
     run_search(&q);
-    assert_eq!(state(&q), make_state(8, false, ALL_BITS));
+    assert_eq!(state(&q), make_state(8, false, shard_bit(5)));
     assert_eq!(on_shard(9, || drain(&q)), vec![8, 2]);
     assert_eq!(state(&q), 0);
 }
@@ -279,7 +511,7 @@ fn equal_rank_priorities_are_ordered_within_a_shard() {
 #[test]
 fn busy_shard_is_skipped() {
     let q: Arc<Queue<u32>> = Arc::new(Queue::new());
-    let guard = q.shards[0].lock();
+    let guard = q.shards[0].shard.lock();
     let (sender, receiver) = std::sync::mpsc::channel();
     let worker = {
         let q = q.clone();
@@ -302,11 +534,11 @@ fn busy_shard_is_skipped() {
 }
 
 fn steal_pressure<T>(q: &Queue<T>, index: usize) -> u32 {
-    q.shards[index].lock().steal_pressure
+    q.shards[index].shard.lock().steal_pressure
 }
 
 fn set_steal_pressure<T>(q: &Queue<T>, index: usize, pressure: u32) {
-    q.shards[index].lock().steal_pressure = pressure;
+    q.shards[index].shard.lock().steal_pressure = pressure;
 }
 
 /// A steal from a shard raises its steal pressure, every pop from it lowers it (not below 0).
@@ -326,6 +558,12 @@ fn steal_pressure_counts_steals_minus_pops() {
     assert_eq!(steal_pressure(&q, 0), 0);
     on_shard(0, || q.pop()).unwrap();
     assert_eq!(steal_pressure(&q, 0), 0, "saturates at 0");
+}
+
+/// A victim needs a high steal pressure before a thief takes it over.
+#[test]
+fn steal_pressure_threshold_is_64() {
+    assert_eq!(STEAL_PRESSURE_THRESHOLD, 64);
 }
 
 /// Instead of stealing from a shard with high steal pressure, a thread makes that shard its home
@@ -373,7 +611,7 @@ fn with_busy_home<R: Send + 'static>(
     q: &Arc<Queue<u32>>,
     f: impl FnOnce(&Queue<u32>) -> R + Send + 'static,
 ) -> (R, usize) {
-    let guard = q.shards[0].lock();
+    let guard = q.shards[0].shard.lock();
     let (sender, receiver) = std::sync::mpsc::channel();
     let worker = {
         let q = q.clone();
