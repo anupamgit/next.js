@@ -13,20 +13,28 @@ attributed.
 
 ## Diagnose
 
-1. Snapshot Request Insights before inspecting source:
+1. Make Request Insights the first diagnostic command. Do not list
+   the workspace, inspect processes, or read source, config, logs, or raw trace
+   files first:
 
    ```bash
-   ./node_modules/.bin/next experimental-request-insights --json
+   ./node_modules/.bin/next experimental-request-insights list --route <route> --json
    ```
 
    If discovery fails, pass the active origin from the CLI error or project
-   configuration with `--url <origin>`. This step is complete when the snapshot
+   configuration with `--url <origin>`. This step is complete when the list
    contains the retained requests or confirms that none remain.
 
 2. Select the completed request matching the reported route and occurrence.
    Separate it from tooling requests and warm retries by route, start time,
-   duration, and status. This step is complete when one request ID is tied to
-   the reported slowdown.
+   duration, and status, then inspect its timeline:
+
+   ```bash
+   ./node_modules/.bin/next experimental-request-insights get <id> --json
+   ```
+
+   The ID may be the unambiguous prefix printed by the list command. This step
+   is complete when one request ID is tied to the reported slowdown.
 
 3. Attribute its wall time. Compare child spans and fetches using `startTime`,
    `durationMs`, `parentSpanId`, and span attributes. Account for the dominant
